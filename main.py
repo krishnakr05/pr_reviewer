@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Request, HTTPException
 from google import genai
 from dotenv import load_dotenv
+from app.indexer import index_repo_files, get_or_create_repo_collection
+from app.retriever import get_similar_reference_files
 import hmac, hashlib, os
 import httpx
 import base64
@@ -42,24 +44,16 @@ async def webhook(request: Request):
         repo_full_name = data["pull_request"]["base"]["repo"]["full_name"]
         default_branch = data["pull_request"]["base"]["repo"]["default_branch"]
 
-        reference_files = await get_reference_files(repo_full_name, default_branch, changed_files)
+        diff = await get_diff_text(diff_url)
+        reference_files = await get_reference_files(repo_full_name, default_branch, changed_files, diff)
         print(f"Reference files: {[f['path'] for f in reference_files]}")
         comments_url = data["pull_request"]["comments_url"]
-        review = await review_pr(diff_url, pr_title, reference_files)
+        review = await review_pr(diff, pr_title, reference_files)
         print(f"Review generated:\n{review}")
 
         await post_comment(comments_url, review)
 
-async def review_pr(diff_url: str, pr_title: str, reference_files: list[dict]):
-    # Fetch the diff (same as before)
-    async with httpx.AsyncClient() as client:
-        diff_response = await client.get(diff_url, headers={
-            "Accept": "application/vnd.github.v3.diff",
-            "Authorization": f"token {GITHUB_TOKEN}"
-        })
-        diff = diff_response.text
-
-    # Build the style examples block from reference files
+async def review_pr(diff: str, pr_title: str, reference_files: list[dict]):
     if reference_files:
         examples = "\n\n".join(
             f"File: {f['path']}\n{f['content']}"
@@ -74,9 +68,8 @@ async def review_pr(diff_url: str, pr_title: str, reference_files: list[dict]):
             "---\n\n"
         )
     else:
-        style_section = ""  # no examples found, skip this section
+        style_section = ""
 
-    # Send to Gemini
     prompt = (
         f"{style_section}"
         f"Now review this PR titled '{pr_title}'.\n\n"
@@ -114,9 +107,16 @@ async def get_changed_filenames(pr_url: str) -> list[str]:
     files = resp.json()                  
     return [f["filename"] for f in files]  
 
+async def get_diff_text(diff_url: str) -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(diff_url, headers={
+            "Accept": "application/vnd.github.v3.diff",
+            "Authorization": f"token {GITHUB_TOKEN}"
+        })
+        return resp.text
 
 async def get_reference_files(repo_full_name: str, default_branch: str,
-                               changed_files: list[str]) -> list[dict]:
+                               changed_files: list[str], diff: str) -> list[dict]:
 
     async with httpx.AsyncClient() as client:
         headers = {
@@ -124,7 +124,7 @@ async def get_reference_files(repo_full_name: str, default_branch: str,
             "Accept": "application/vnd.github.v3+json"
         }
 
-        # 1. Get every file path in the repo (one API call)
+        # 1. Get every file path in the repo (unchanged from before)
         tree_resp = await client.get(
             f"https://api.github.com/repos/{repo_full_name}/git/trees/{default_branch}",
             headers=headers,
@@ -132,33 +132,43 @@ async def get_reference_files(repo_full_name: str, default_branch: str,
         )
         tree = tree_resp.json().get("tree", [])
 
-        # 2. Find which extensions the changed files use (e.g. "py")
         extensions = {f.split(".")[-1] for f in changed_files if "." in f}
 
-        # 3. Filter the repo's files: same extension, not in the PR, not too big
         candidates = [
             item["path"] for item in tree
-            if item["type"] == "blob"                          # only files, not folders
-            and item["path"].split(".")[-1] in extensions      # same extension
-            and item["path"] not in changed_files              # not already in this PR
-            and item.get("size", 0) < 20_000                  # skip very large files
+            if item["type"] == "blob"
+            and item["path"].split(".")[-1] in extensions
+            and item["path"] not in changed_files
+            and item.get("size", 0) < 20_000
         ]
 
-        # 4. Pick the first 2 and fetch their contents
-        reference_files = []
-        for path in candidates[:2]:
-            content_resp = await client.get(
-                f"https://api.github.com/repos/{repo_full_name}/contents/{path}",
-                headers=headers,
-                params={"ref": default_branch}
-            )
-            content_data = content_resp.json()
+        # 2. Check whether this repo has already been indexed into Chroma.
+        #    If not, fetch + embed all candidate files now (one-time cost).
+        collection = get_or_create_repo_collection(repo_full_name)
+        if collection.count() == 0:
+            files_to_index = []
+            for path in candidates:
+                content_resp = await client.get(
+                    f"https://api.github.com/repos/{repo_full_name}/contents/{path}",
+                    headers=headers,
+                    params={"ref": default_branch}
+                )
+                content_data = content_resp.json()
+                if "content" in content_data:
+                    decoded = base64.b64decode(content_data["content"]).decode("utf-8", errors="ignore")
+                    files_to_index.append({
+                        "path": path,
+                        "content": decoded[:3000],
+                        "extension": path.split(".")[-1],
+                    })
+            if files_to_index:
+                index_repo_files(repo_full_name, files_to_index)
 
-            if "content" in content_data:
-                decoded = base64.b64decode(content_data["content"]).decode("utf-8", errors="ignore")
-                reference_files.append({
-                    "path": path,
-                    "content": decoded[:3000]   # cap length so we don't waste tokens
-                })
-
+    # 3. Now retrieve the top-k files most similar to this PR's diff,
+    #    instead of blindly taking candidates[:2].
+    reference_files = get_similar_reference_files(
+        repo_full_name=repo_full_name,
+        diff_text=diff,
+        top_k=2,
+    )
     return reference_files
