@@ -53,6 +53,24 @@ async def webhook(request: Request):
 
         await post_comment(comments_url, review)
 
+    if event == "push":
+        repo_full_name = data["repository"]["full_name"]
+        default_branch = data["repository"]["default_branch"]
+        ref = data["ref"]  
+
+        if ref == f"refs/heads/{default_branch}":
+            changed_paths = set()
+            for commit in data.get("commits", []):
+                changed_paths.update(commit.get("added", []))
+                changed_paths.update(commit.get("modified", []))
+
+            py_files = [p for p in changed_paths if p.endswith(".py")]
+            if py_files:
+                files_to_index = await fetch_file_contents(repo_full_name, default_branch, py_files)
+                if files_to_index:
+                    index_repo_files(repo_full_name, files_to_index)
+                    print(f"Re-indexed {len(files_to_index)} files after push to {repo_full_name}")
+
 async def review_pr(diff: str, pr_title: str, reference_files: list[dict]):
     if reference_files:
         examples = "\n\n".join(
@@ -172,3 +190,18 @@ async def get_reference_files(repo_full_name: str, default_branch: str,
         top_k=2,
     )
     return reference_files
+
+async def fetch_file_contents(repo_full_name: str, ref: str, paths: list[str]) -> list[dict]:
+    async with httpx.AsyncClient() as client:
+        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+        files = []
+        for path in paths:
+            resp = await client.get(
+                f"https://api.github.com/repos/{repo_full_name}/contents/{path}",
+                headers=headers, params={"ref": ref}
+            )
+            content_data = resp.json()
+            if "content" in content_data:
+                decoded = base64.b64decode(content_data["content"]).decode("utf-8", errors="ignore")
+                files.append({"path": path, "content": decoded[:3000], "extension": path.split(".")[-1]})
+        return files
