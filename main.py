@@ -142,13 +142,17 @@ async def get_reference_files(repo_full_name: str, default_branch: str,
             "Accept": "application/vnd.github.v3+json"
         }
 
-        # 1. Get every file path in the repo (unchanged from before)
-        tree_resp = await client.get(
-            f"https://api.github.com/repos/{repo_full_name}/git/trees/{default_branch}",
-            headers=headers,
-            params={"recursive": "1"}
-        )
-        tree = tree_resp.json().get("tree", [])
+        # 1. Get every file path in the repo 
+        try:
+            tree_resp = await client.get(
+                f"https://api.github.com/repos/{repo_full_name}/git/trees/{default_branch}",
+                headers=headers,
+                params={"recursive": "1"}
+            )
+            tree = tree_resp.json().get("tree", [])
+        except Exception as e:
+            print(f"Failed to fetch repo tree: {e}")
+            tree = [] 
 
         extensions = {f.split(".")[-1] for f in changed_files if "." in f}
 
