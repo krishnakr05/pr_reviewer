@@ -2,6 +2,21 @@
 from app.indexer import get_chroma_client
 from app.embeddings import GeminiEmbeddingFunction
 
+def clean_diff_for_embedding(diff_text: str) -> str:
+    """
+    Strips unified-diff noise (hunk headers, file markers) and the
+    +/- prefix, keeping the actual code content for a cleaner embedding.
+    """
+    lines = []
+    for line in diff_text.splitlines():
+        if line.startswith(("@@", "+++", "---", "diff --git", "index ")):
+            continue
+        if line.startswith(("+", "-")):
+            lines.append(line[1:])  # drop the +/- marker, keep the code
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
 def get_similar_reference_files(
     repo_full_name: str,
     diff_text: str,
@@ -26,7 +41,7 @@ def get_similar_reference_files(
 
     # Query embedding uses CODE_RETRIEVAL_QUERY — asymmetric from how docs were stored
     query_embedder = GeminiEmbeddingFunction(task_type="CODE_RETRIEVAL_QUERY")
-    query_vector = query_embedder([diff_text])[0]
+    query_vector = query_embedder([clean_diff_for_embedding(diff_text)])[0]
 
     where_filter = {"extension": extension} if extension else None
 
